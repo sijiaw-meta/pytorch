@@ -9557,6 +9557,9 @@ class TestPrecompileCustomOpModules(TestCase):
                 self.assertIn(f'SERVING_MODE = "{mode}"', python_code)
 
 
+def legacy_op(x: torch.Tensor) -> torch.Tensor: ...
+
+
 class TestPrecompileCustomOpRecording(TestCase):
     def _op(self, name):
         ns = f"precompile_recording_{uuid.uuid4().hex}"
@@ -9582,6 +9585,70 @@ class TestPrecompileCustomOpRecording(TestCase):
         gm = torch.fx.GraphModule(torch.nn.Module(), graph)
         expected = {(called_name, ""), (passed_name, ""), ("aten::add", "Tensor")}
         self.assertEqual(_op_names(gm), expected)
+
+    def test_an_op_the_artifact_cannot_import_is_reported_at_capture(self):
+        from torch._precompile import _custom_op_modules
+
+        op, qualname = self._op("in_main")
+        op._init_fn.__module__ = "__main__"
+        recorded, _ = self._op("recorded")
+        module = types.ModuleType(f"precompile_registering_{uuid.uuid4().hex}")
+        module.__spec__ = importlib.machinery.ModuleSpec(module.__name__, None)
+        self.enterContext(mock.patch.dict(sys.modules, {module.__name__: module}))
+        recorded._init_fn.__module__ = module.__name__
+        ns = f"precompile_library_{uuid.uuid4().hex}"
+        lib = self.enterContext(torch.library._scoped_library(ns, "DEF"))
+        lib.define("f(Tensor x) -> Tensor")
+        torch._custom_ops.custom_op(f"{ns}::legacy_op")(legacy_op)
+        registry = torch._custom_op.impl.global_registry
+        self.addCleanup(registry[f"{ns}::legacy_op"]._destroy)
+        names = [(qualname, ""), (f"{ns}::f", ""), (f"{ns}::legacy_op", "")]
+        names.append((recorded._qualname, ""))
+        importlib.import_module("torch.export.custom_ops")
+
+        # Torch's own ops, registered from C++ and from Python inside torch.
+        names += [("aten::add", "Tensor"), ("export::access_subclass_inner_tensor", "")]
+        with self.assertLogs("torch._precompile", level="WARNING") as logs:
+            self.assertEqual(_custom_op_modules(names), (module.__name__,))
+        (message,) = logs.output
+        self.assertIn(qualname, message)
+        self.assertIn(f"{ns}::f", message)
+        self.assertIn(f"{ns}::legacy_op", message)
+        self.assertNotIn(recorded._qualname, message)
+        self.assertNotIn("aten::add", message)
+        self.assertNotIn("export::", message)
+
+    def test_no_op_torch_registers_is_reported(self):
+        script = textwrap.dedent(
+            """
+            import torch
+            import torch.onnx.ops
+            from torch._precompile import _TORCH_OP_NAMESPACES, _custom_op_module, _registered_by_torch
+            if torch.distributed.is_available():
+                import torch.distributed.fsdp
+                import torch.distributed.pipelining
+                import torch.distributed.tensor
+                import torch.distributed._ops.device_mesh
+            reported = set()
+            for name in torch._C._dispatch_get_all_op_names():
+                op_name, _, overload = name.partition(".")
+                ns = op_name.split("::")[0]
+                debug = torch._C._dispatch_find_schema_or_throw(op_name, overload).debug()
+                if ".py:" not in debug:
+                    if ns not in _TORCH_OP_NAMESPACES:
+                        reported.add(ns)
+                elif _custom_op_module(op_name, overload) is None and not _registered_by_torch(op_name, overload):
+                    reported.add(ns)
+            print(*reported)
+            """
+        )
+        # Only a source build records C++ schemas under torch/, so they are checked
+        # against the list itself. The script first imports the torch modules that
+        # register ops on import. Namespaces this build does not register (vulkan,
+        # metal, nnapi, ...) are not checked.
+        out = subprocess.check_output([sys.executable, "-c", script], text=True)
+        # "_test" holds TorchScript's own test ops.
+        self.assertEqual(set(out.split()) - {"_test"}, set())
 
     def test_a_capture_records_the_ops_of_each_backend_graph(self):
         from torch._dynamo.precompile_package import _CapturePackage

@@ -8,13 +8,13 @@ import inspect
 import itertools
 import logging
 import operator
+import re
 import threading
 import types
 import typing
 from collections import defaultdict
 from collections.abc import Callable, Sequence
-from typing import Any, Optional, Protocol, TYPE_CHECKING, Union
-from typing_extensions import Never
+from typing import Any, NoReturn, Optional, Protocol, TYPE_CHECKING, Union
 
 import sympy
 
@@ -461,6 +461,8 @@ class Op:
     # used for tt.elementwise_inline_asm
     # `is_pure = True` assumes the asm block has no side-effects
     is_pure: bool = False
+    inline_asm: str | None = None
+    asm_constraints: str | None = None
 
     def __post_init__(self) -> None:
         if self.name == "tt.call":
@@ -1080,19 +1082,41 @@ def ttir_to_functions(
             block_ops = op_stack[parent_block_id]
 
             is_pure = False
+            inline_asm = None
+            asm_constraints = None
             # Handle the case for tt.elementwise_inline_asm to set `is_pure` for mutation analysis
             if name == "tt.elementwise_inline_asm":
                 is_pure = op.get_bool_attr("pure")
+                inline_asm = op.get_str_attr("asm_string")
+                asm_constraints = op.get_str_attr("constraints")
 
             if result_ids:
                 for result_id in result_ids:
                     res = Intermediate(result_id)
-                    block_ops[res].append(Op(name, callee, args, res, is_pure=is_pure))
+                    block_ops[res].append(
+                        Op(
+                            name,
+                            callee,
+                            args,
+                            res,
+                            is_pure=is_pure,
+                            inline_asm=inline_asm,
+                            asm_constraints=asm_constraints,
+                        )
+                    )
             else:
                 next_fake_intermediate -= 1
                 fake_res = Intermediate(next_fake_intermediate)
                 block_ops[fake_res].append(
-                    Op(name, callee, args, fake_res, is_pure=is_pure)
+                    Op(
+                        name,
+                        callee,
+                        args,
+                        fake_res,
+                        is_pure=is_pure,
+                        inline_asm=inline_asm,
+                        asm_constraints=asm_constraints,
+                    )
                 )
 
     ttir_module.walk(mlir_to_functions)
@@ -1176,6 +1200,7 @@ def get_tma_stores(
                     and op_info.is_tma_store
                     and op_info.write_indexes is not None
                 ):
+                    op_info.validate_access_model(op)
                     result.update(op.args[idx] for idx in op_info.write_indexes(op))
 
     for val in list(result):
@@ -1200,10 +1225,14 @@ class TensorAccesses:
     can_fuse_epilogue: bool
 
 
-class IgnoreUnknownOp(Protocol):
-    """Returns True if the op should be skipped; otherwise the caller raises."""
+class OpPredicate(Protocol):
+    """Return an operation-dependent boolean property."""
 
     def __call__(self, op: Op) -> bool: ...
+
+
+# Preserve the legacy callback type name for external registrations.
+IgnoreUnknownOp = OpPredicate
 
 
 class ReadWriteIndexes(Protocol):
@@ -1224,12 +1253,51 @@ def first_two_args(op: Op) -> list[int]:
     return list(range(min(2, len(op.args))))
 
 
+def _classify_inline_asm(op: Op) -> tuple[int, ...] | None:
+    """Return read indexes for pure asm or polling loads; None means unsupported."""
+    if op.name != "tt.elementwise_inline_asm":
+        return None
+    if op.is_pure:
+        return ()
+
+    # Only .gpu.global.b32 acquire/relaxed loads, optionally preceded by a
+    # literal nanosleep, are supported. Other scopes/types, volatile loads,
+    # brace-wrapped asm, dynamic sleeps, and extra instructions/operands retain
+    # conservative handling.
+    if (
+        len(op.args) == 1
+        and op.asm_constraints is not None
+        and op.asm_constraints.replace(" ", "") == "=r,l"
+        and op.inline_asm is not None
+        and re.fullmatch(
+            r"\s*(?:nanosleep\.u32\s+[0-9]+;\s*)?"
+            r"ld\.(?:relaxed|acquire)\.gpu\.global\.b32\s+\$0,\s*\[\$1\];\s*",
+            op.inline_asm,
+        )
+        is not None
+    ):
+        return (0,)
+    return None
+
+
 @dataclasses.dataclass(frozen=True)
 class _KernelAccessOpInfo:
     read_indexes: ReadWriteIndexes | None = None
     write_indexes: ReadWriteIndexes | None = None
     is_tma_store: bool = False
-    ignore_if: IgnoreUnknownOp | None = None
+    supported_if: OpPredicate | None = None
+    is_load: bool | OpPredicate = False
+
+    def validate_access_model(self, op: Op) -> None:
+        """Reject unsupported operations before evaluating access callbacks."""
+        if self.supported_if is not None and not self.supported_if(op):
+            raise RuntimeError(
+                f"ttir analysis hit an op we do not know how to analyze: {op.name}"
+            )
+
+    def result_is_loaded(self, op: Op) -> bool:
+        """Return whether memory provides this operation's result."""
+        return self.is_load(op) if callable(self.is_load) else self.is_load
 
 
 # List from Triton Github include/triton/Dialect/Triton/IR/TritonOps.td.
@@ -1247,14 +1315,16 @@ _KERNEL_ACCESS_OPS: dict[str, _KernelAccessOpInfo] = {
         read_indexes=first_arg, write_indexes=first_arg
     ),
     "tt.experimental_tensormap_create": _KernelAccessOpInfo(write_indexes=first_arg),
-    "tt.load": _KernelAccessOpInfo(read_indexes=first_arg),
-    "tt.load_tensor_descriptor": _KernelAccessOpInfo(read_indexes=first_arg),
-    "tt.descriptor_load": _KernelAccessOpInfo(read_indexes=first_arg),
+    "tt.load": _KernelAccessOpInfo(read_indexes=first_arg, is_load=True),
+    "tt.load_tensor_descriptor": _KernelAccessOpInfo(
+        read_indexes=first_arg, is_load=True
+    ),
+    "tt.descriptor_load": _KernelAccessOpInfo(read_indexes=first_arg, is_load=True),
     "tt.descriptor_reduce": _KernelAccessOpInfo(
         read_indexes=first_arg, write_indexes=first_arg
     ),
     "tt.descriptor_scatter": _KernelAccessOpInfo(write_indexes=first_arg),
-    "tt.descriptor_gather": _KernelAccessOpInfo(read_indexes=first_arg),
+    "tt.descriptor_gather": _KernelAccessOpInfo(read_indexes=first_arg, is_load=True),
     "ttng.async_tma_copy_global_to_local": _KernelAccessOpInfo(
         read_indexes=first_two_args
     ),
@@ -1264,7 +1334,11 @@ _KERNEL_ACCESS_OPS: dict[str, _KernelAccessOpInfo] = {
     ),
     "ttng.async_tma_scatter": _KernelAccessOpInfo(write_indexes=first_arg),
     "ttng.async_tma_gather": _KernelAccessOpInfo(read_indexes=first_arg),
-    "tt.elementwise_inline_asm": _KernelAccessOpInfo(ignore_if=lambda op: op.is_pure),
+    "tt.elementwise_inline_asm": _KernelAccessOpInfo(
+        read_indexes=lambda op: _classify_inline_asm(op) or (),
+        supported_if=lambda op: _classify_inline_asm(op) is not None,
+        is_load=lambda op: bool(_classify_inline_asm(op)),
+    ),
 }
 
 
@@ -1282,8 +1356,20 @@ def register_kernel_access_op(
     write_indexes: Sequence[int] | ReadWriteIndexes | None = None,
     is_tma_store: bool = False,
     ignore_if: IgnoreUnknownOp | None = None,
+    supported_if: OpPredicate | None = None,
+    is_load: bool | OpPredicate = False,
 ) -> None:
-    """Register a Triton op for kernel read/write analysis."""
+    """Register a Triton op for kernel tensor read/write analysis.
+
+    A supported_if callback returning False rejects the op before any index
+    callback runs; True permits analysis. Rejection raises into the caller's
+    conservative fallback. The legacy ignore_if keyword is an alias used when
+    supported_if is absent. It remains restricted to ops without read/write
+    indexes, so accepting the op models no tensor accesses.
+    is_load marks results read from memory, so write-address tracing stops at
+    those results instead of marking the source pointer as written. It may be
+    a constant bool or an operation predicate; it does not affect read tracing.
+    """
     if is_tma_store and write_indexes is None:
         raise AssertionError(
             f"{name} is marked as a TMA store but has no write indexes"
@@ -1301,7 +1387,8 @@ def register_kernel_access_op(
             None if write_indexes is None else _read_write_indexes(write_indexes)
         ),
         is_tma_store=is_tma_store,
-        ignore_if=ignore_if,
+        supported_if=supported_if if supported_if is not None else ignore_if,
+        is_load=is_load,
     )
 
 
@@ -1345,15 +1432,11 @@ def analyze_kernel_access(
 
     for op_list in ops.values():
         for op in op_list:
-            # If we encounter an operation with effects that cannot be reliably analyzed
-            # (e.g. `tt.elementwise_inline_asm`), we assume it does not mutate any input parameters.
             op_info = _KERNEL_ACCESS_OPS.get(op.name)
-            if op_info is not None and op_info.ignore_if is not None:
-                if op_info.ignore_if(op):
+            if op_info is not None:
+                op_info.validate_access_model(op)
+                if op_info.read_indexes is None and op_info.write_indexes is None:
                     continue
-                raise RuntimeError(
-                    f"ttir analysis hit an op we do not know how to analyze: {op.name}"
-                )
 
             if op.name == "tt.experimental_tensormap_create":
                 # Note: this is how we implement experimental_descriptor_store mutation analysis.
@@ -1437,7 +1520,12 @@ def analyze_kernel_access(
                     access_count[arg.idx] += 1
             elif isinstance(arg, Intermediate) and not arg.fake():
                 for op in ops[arg]:
-                    if skip_loads and op.name == "tt.load":
+                    op_info = _KERNEL_ACCESS_OPS.get(op.name)
+                    if (
+                        skip_loads
+                        and op_info is not None
+                        and op_info.result_is_loaded(op)
+                    ):
                         continue
                     if op.name in POINTER_ONLY_OPS:
                         stack.append(op.args[0])
@@ -2195,7 +2283,7 @@ class TritonHOPifier:
     TritonHOPifier is an abstract class that can be overridden by its subclasses.
     """
 
-    def raise_unsupported(self, msg: str) -> Never:
+    def raise_unsupported(self, msg: str) -> NoReturn:
         raise NotImplementedError("abstract method")
 
     def is_callable(self, maybe_callable: object) -> bool:
@@ -2848,7 +2936,7 @@ class TritonHOPifier:
 
 
 class TracingTritonHOPifier(TritonHOPifier):
-    def raise_unsupported(self, msg: str) -> Never:
+    def raise_unsupported(self, msg: str) -> NoReturn:
         raise RuntimeError(msg)
 
     def is_callable(self, maybe_callable: object) -> bool:
